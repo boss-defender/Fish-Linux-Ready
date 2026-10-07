@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────────────
+#  fish-look-cool
+#  One command: update system → install fish → make it default → cool prompt.
+#
+#  Supported (auto-detected):
+#    apt     → Ubuntu, Debian, Linux Mint, Pop!_OS, Zorin OS, Kali Linux
+#    dnf     → Fedora
+#    pacman  → Arch Linux, Manjaro (and Arch-based derivatives)
+#
+#  Usage:  chmod +x fish-look-cool && ./fish-look-cool
+# ──────────────────────────────────────────────────────────────────────────────
+set -Eeuo pipefail
+
+# ── pretty output ─────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+    C_B=$'\e[1;34m'; C_G=$'\e[1;32m'; C_Y=$'\e[1;33m'; C_R=$'\e[1;31m'; C_0=$'\e[0m'
+else
+    C_B=""; C_G=""; C_Y=""; C_R=""; C_0=""
+fi
+info() { printf '%s==>%s %s\n' "$C_B" "$C_0" "$*"; }
+ok()   { printf '%s ✔ %s %s\n' "$C_G" "$C_0" "$*"; }
+warn() { printf '%s !  %s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+err()  { printf '%s ✘  %s %s\n' "$C_R" "$C_0" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+trap 'err "Something went wrong near line $LINENO. Setup aborted."' ERR
+
+KEEPALIVE_PID=""
+cleanup() { [[ -n "$KEEPALIVE_PID" ]] && kill "$KEEPALIVE_PID" 2>/dev/null || true; }
+trap cleanup EXIT
+
+# ── preflight ─────────────────────────────────────────────────────────────────
+[[ "$(uname -s)" == "Linux" ]] || die "This script only supports Linux."
+
+if [[ $EUID -eq 0 ]]; then
+    SUDO=""
+    TARGET_USER="${SUDO_USER:-root}"      # if run via sudo, configure the real user
+else
+    command -v sudo >/dev/null 2>&1 || die "sudo is required. Install it or run this script as root."
+    SUDO="sudo"
+    TARGET_USER="$(id -un)"
+fi
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+[[ -n "$TARGET_HOME" && -d "$TARGET_HOME" ]] || die "Could not find the home directory of '$TARGET_USER'."
+
+run() { $SUDO "$@"; }
+
+# ── detect OS / package manager ───────────────────────────────────────────────
+detect_os() {
+    [[ -r /etc/os-release ]] || die "Cannot read /etc/os-release — unable to detect your distro."
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_NAME="${PRETTY_NAME:-$OS_ID}"
+    local like=" ${ID_LIKE:-} "
+    PM=""
+
+    case "$OS_ID" in
+        ubuntu|debian|pop|linuxmint|zorin|kali|raspbian|elementary|neon) PM="apt" ;;
+        fedora|nobara)                                                   PM="dnf" ;;
+        arch|manjaro|endeavouros|garuda|artix|cachyos|arcolinux)         PM="pacman" ;;
+    esac
+
+    # Unknown derivative? Fall back to ID_LIKE, then to whatever package manager exists.
+    if [[ -z "$PM" ]]; then
+        if   [[ "$like" == *" debian "* || "$like" == *" ubuntu "* ]]; then PM="apt"
+        elif [[ "$like" == *" fedora "* || "$like" == *" rhel "*   ]]; then PM="dnf"
+        elif [[ "$like" == *" arch "*   ]];                           then PM="pacman"
+        elif command -v apt-get >/dev/null 2>&1;                      then PM="apt"
+        elif command -v dnf     >/dev/null 2>&1;                      then PM="dnf"
+        elif command -v pacman  >/dev/null 2>&1;                      then PM="pacman"
+        fi
+    fi
+
+    [[ -n "$PM" ]] || die "Unsupported distro: $OS_NAME"
+}
+
+# ── keep sudo alive so long upgrades don't ask for the password twice ────────
+start_sudo_keepalive() {
+    [[ -n "$SUDO" ]] || return 0
+    info "Asking for your sudo password once…"
+    sudo -v || die "sudo authentication failed."
+    ( while kill -0 "$$" 2>/dev/null; do sudo -n true 2>/dev/null; sleep 50; done ) &
+    KEEPALIVE_PID=$!
+}
+
+# ── update + upgrade ──────────────────────────────────────────────────────────
+update_system() {
+    case "$PM" in
+        apt)
+            run env DEBIAN_FRONTEND=noninteractive apt-get update
+            run env DEBIAN_FRONTEND=noninteractive apt-get -y \
+                -o Dpkg::Options::=--force-confdef \
+                -o Dpkg::Options::=--force-confold upgrade
+            ;;
+        dnf)
+            run dnf -y upgrade --refresh
+            ;;
+        pacman)
+            run pacman -Syu --noconfirm
+            ;;
+    esac
+}
+
+# ── install fish ──────────────────────────────────────────────────────────────
+install_fish() {
+    case "$PM" in
+        apt)    run env DEBIAN_FRONTEND=noninteractive apt-get install -y fish ;;
+        dnf)    run dnf install -y fish ;;
+        pacman) run pacman -S --noconfirm --needed fish ;;
+    esac
+    FISH_PATH="$(command -v fish)" || die "fish was not found after installation."
+}
+
+# ── make fish the default shell ───────────────────────────────────────────────
+set_default_shell() {
+    if ! grep -qx "$FISH_PATH" /etc/shells 2>/dev/null; then
+        echo "$FISH_PATH" | run tee -a /etc/shells >/dev/null
+    fi
+
+    local current
+    current="$(getent passwd "$TARGET_USER" | cut -d: -f7)"
+    if [[ "$current" == "$FISH_PATH" ]]; then
+        ok "fish is already the default shell for $TARGET_USER"
+        return 0
+    fi
+
+    # chsh via sudo/root needs no password prompt; usermod is the fallback
+    # (e.g. Fedora without util-linux-user).
+    if ! run chsh -s "$FISH_PATH" "$TARGET_USER" 2>/dev/null; then
+        run usermod -s "$FISH_PATH" "$TARGET_USER"
+    fi
+    ok "Default shell for $TARGET_USER set to $FISH_PATH"
+}
+
+# ── write the cool prompt ─────────────────────────────────────────────────────
+install_prompt() {
+    local func_dir="$TARGET_HOME/.config/fish/functions"
+    local prompt_file="$func_dir/fish_prompt.fish"
+
+    mkdir -p "$func_dir"
+
+    if [[ -f "$prompt_file" ]]; then
+        local backup="$prompt_file.bak.$(date +%Y%m%d-%H%M%S)"
+        cp "$prompt_file" "$backup"
+        warn "Existing prompt backed up to $backup"
+    fi
+
+    cat > "$prompt_file" <<'FISH_PROMPT'
+function fish_prompt
+    set -l green (set_color --bold brgreen)
+    set -l reset (set_color normal)
+
+    printf "%s%s%s\n" "$green" (prompt_pwd) "$reset"
+    printf "%s╵%s\n" "$green" "$reset"
+    printf "%s└───❯ %s" "$green" "$reset"
+end
+FISH_PROMPT
+
+    # If we're root acting on behalf of a normal user, hand the files back to them.
+    if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
+        chown -R "$TARGET_USER:$(id -gn "$TARGET_USER")" "$TARGET_HOME/.config/fish"
+    fi
+
+    # Equivalent of `source fish_prompt.fish`: make sure it parses cleanly.
+    # (Fish also auto-loads everything in ~/.config/fish/functions on startup.)
+    if "$FISH_PATH" -n "$prompt_file"; then
+        ok "Prompt installed → $prompt_file"
+    else
+        warn "Prompt file was written but fish reported a syntax problem."
+    fi
+}
+
+# ── remove the boring welcome message ─────────────────────────────────────────
+disable_greeting() {
+    # Run as the target user so the universal variable lands in THEIR fish_variables.
+    if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
+        runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" "$FISH_PATH" -c 'set -U fish_greeting ""'
+    else
+        "$FISH_PATH" -c 'set -U fish_greeting ""'
+    fi
+    ok "Greeting removed"
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+main() {
+    printf '\n%s  🐟  fish-look-cool%s\n\n' "$C_B" "$C_0"
+
+    detect_os
+    info "Detected: $OS_NAME  (package manager: $PM)"
+    info "Configuring for user: $TARGET_USER"
+
+    start_sudo_keepalive
+
+    info "Updating & upgrading the system (this can take a while)…"
+    update_system
+    ok "System is up to date"
+
+    info "Installing fish…"
+    install_fish
+    ok "fish installed: $("$FISH_PATH" --version)"
+
+    info "Setting fish as the default shell…"
+    set_default_shell
+
+    info "Removing the fish greeting…"
+    disable_greeting
+
+    info "Installing the custom prompt…"
+    install_prompt
+
+    printf '\n%s  All done! 🎉%s\n' "$C_G" "$C_0"
+    printf '  fish is your default shell from your next login.\n\n'
+
+    # Drop straight into fish so the new look shows up right now.
+    if [[ -t 0 && -t 1 && $EUID -ne 0 ]]; then
+        cleanup
+        exec "$FISH_PATH"
+    else
+        printf '  Log out and back in (or open a new terminal) to see it.\n\n'
+    fi
+}
+
+main "$@"
