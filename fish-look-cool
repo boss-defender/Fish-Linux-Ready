@@ -9,6 +9,7 @@
 #    pacman  → Arch Linux, Manjaro (and Arch-based derivatives)
 #
 #  Usage:  chmod +x fish-look-cool && ./fish-look-cool
+#          ./fish-look-cool --prompt-only   (fish already set up? just refresh the prompt)
 # ──────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
 
@@ -30,6 +31,20 @@ KEEPALIVE_PID=""
 cleanup() { [[ -n "$KEEPALIVE_PID" ]] && kill "$KEEPALIVE_PID" 2>/dev/null || true; }
 trap cleanup EXIT
 
+# ── options ───────────────────────────────────────────────────────────────────
+PROMPT_ONLY=0
+case "${1:-}" in
+    "")                  ;;
+    --prompt-only|-p)    PROMPT_ONLY=1 ;;
+    -h|--help)
+        printf 'Usage: %s [--prompt-only]\n\n' "${0##*/}"
+        printf '  (no option)     update system, install fish, make it default, install prompt\n'
+        printf '  --prompt-only   only (re)install the fish prompt; skips updates and installs\n'
+        exit 0
+        ;;
+    *) die "Unknown option: $1  (try --help)" ;;
+esac
+
 # ── preflight ─────────────────────────────────────────────────────────────────
 [[ "$(uname -s)" == "Linux" ]] || die "This script only supports Linux."
 
@@ -37,7 +52,9 @@ if [[ $EUID -eq 0 ]]; then
     SUDO=""
     TARGET_USER="${SUDO_USER:-root}"      # if run via sudo, configure the real user
 else
-    command -v sudo >/dev/null 2>&1 || die "sudo is required. Install it or run this script as root."
+    if [[ $PROMPT_ONLY -eq 0 ]]; then
+        command -v sudo >/dev/null 2>&1 || die "sudo is required. Install it or run this script as root."
+    fi
     SUDO="sudo"
     TARGET_USER="$(id -un)"
 fi
@@ -135,40 +152,187 @@ set_default_shell() {
 }
 
 # ── write the cool prompt ─────────────────────────────────────────────────────
+backup_if_exists() {
+    local f="$1" backup
+    if [[ -f "$f" ]]; then
+        backup="$f.bak.$(date +%Y%m%d-%H%M%S)"
+        cp "$f" "$backup"
+        warn "Existing $(basename "$f") backed up to $backup"
+    fi
+}
+
 install_prompt() {
     local func_dir="$TARGET_HOME/.config/fish/functions"
     local prompt_file="$func_dir/fish_prompt.fish"
+    local right_file="$func_dir/fish_right_prompt.fish"
 
     mkdir -p "$func_dir"
+    backup_if_exists "$prompt_file"
+    backup_if_exists "$right_file"
 
-    if [[ -f "$prompt_file" ]]; then
-        local backup="$prompt_file.bak.$(date +%Y%m%d-%H%M%S)"
-        cp "$prompt_file" "$backup"
-        warn "Existing prompt backed up to $backup"
-    fi
-
+    # ── left prompt ──────────────────────────────────────────────────────────
     cat > "$prompt_file" <<'FISH_PROMPT'
-function fish_prompt
-    set -l green (set_color --bold brgreen)
-    set -l reset (set_color normal)
+# fish-look-cool · fish_prompt
+#
+#   ╭─ user@host  ~/projects/blog  on main ●1 ✚2 …3  ✘ 127
+#   │
+#   ╰─❯
+#
+#  • a blank line separates a command's output from the next prompt
+#  • the arrow turns red (and the exit code shows) when a command fails
+#  • user@host only appears over SSH or as root
+#  • the clock and "took 4s" live on the right (fish_right_prompt.fish)
+#
+# Colours are Tokyo-Night-ish hex values; change them to taste.
 
-    printf "%s%s%s\n" "$green" (prompt_pwd) "$reset"
-    printf "%s╵%s\n" "$green" "$reset"
-    printf "%s└───❯ %s" "$green" "$reset"
+# ── git styling (used by the built-in fish_git_prompt) ───────────────────────
+set -g __fish_git_prompt_show_informative_status 1
+set -g __fish_git_prompt_char_stateseparator ' '
+set -g __fish_git_prompt_color_branch bb9af7 --bold
+set -g __fish_git_prompt_color_cleanstate 9ece6a
+set -g __fish_git_prompt_color_stagedstate 9ece6a
+set -g __fish_git_prompt_color_dirtystate e0af68
+set -g __fish_git_prompt_color_untrackedfiles 7dcfff
+set -g __fish_git_prompt_color_invalidstate f7768e
+set -g __fish_git_prompt_color_upstream 7aa2f7
+
+# ── blank line between commands ──────────────────────────────────────────────
+# After every command we remember "leave a gap"; `clear` / `reset` forget it so
+# the prompt doesn't start with an empty line at the top of a fresh screen.
+function __flc_postexec --on-event fish_postexec
+    if string match -qr '^\s*(clear|reset)\s*$' -- "$argv[1]"
+        set -e __flc_gap
+    else
+        set -g __flc_gap 1
+    end
+end
+
+# ── readable path: ~/a/b/c, or …/x/y/z when it is deeper than 3 levels ───────
+function __flc_pwd
+    set -l p $PWD
+    if test "$p" = "$HOME"
+        echo '~'
+        return
+    end
+    if string match -q -- "$HOME/*" "$p"
+        set p '~'(string sub -s (math (string length -- "$HOME") + 1) -- "$p")
+    end
+    set -l parts (string split / -- $p)
+    if test (count $parts) -gt 4
+        set p '…/'(string join / $parts[-3..-1])
+    end
+    echo $p
+end
+
+function fish_prompt
+    set -l last_status $status
+
+    # the gap
+    set -q __flc_gap; and echo
+
+    # ╭─ line 1
+    set_color 565f89
+    echo -n '╭─ '
+
+    # user@host — only over SSH or as root
+    if set -q SSH_CONNECTION; or test "$USER" = root
+        if test "$USER" = root
+            set_color --bold f7768e
+        else
+            set_color --bold 7dcfff
+        end
+        echo -n "$USER@"(prompt_hostname)' '
+    end
+
+    # directory
+    set_color --bold 7aa2f7
+    echo -n (__flc_pwd)
+
+    # git branch + state
+    set -l git (fish_git_prompt '%s' 2>/dev/null)
+    if test -n "$git"
+        set_color 565f89
+        echo -n ' on '
+        echo -n $git
+    end
+
+    # python virtualenv
+    if set -q VIRTUAL_ENV
+        set_color 565f89
+        echo -n ' via '
+        set_color 73daca
+        echo -n (string replace -r '.*/' '' -- $VIRTUAL_ENV)
+    end
+
+    # exit code of the last command, if it failed
+    if test $last_status -ne 0
+        set_color --bold f7768e
+        echo -n "  ✘ $last_status"
+    end
+
+    # │ spacer line (the little gap between the info line and the arrow)
+    set_color normal
+    echo
+    set_color 565f89
+    echo '│'
+
+    # ╰─❯ arrow line
+    echo -n '╰─'
+    if test $last_status -eq 0
+        set_color --bold 9ece6a
+    else
+        set_color --bold f7768e
+    end
+    echo -n '❯ '
+    set_color normal
 end
 FISH_PROMPT
+
+    # ── right prompt (duration of slow commands + clock) ─────────────────────
+    cat > "$right_file" <<'FISH_RIGHT'
+# fish-look-cool · fish_right_prompt
+#   took 12s  ·  14:05:32
+# Delete this file if you'd rather have nothing on the right.
+function fish_right_prompt
+    set -l ms 0
+    set -q CMD_DURATION; and set ms $CMD_DURATION
+
+    # only mention commands that took 3 seconds or more
+    if test $ms -ge 3000
+        set -l total (math "floor($ms / 1000)")
+        set -l h (math "floor($total / 3600)")
+        set -l m (math "floor(($total % 3600) / 60)")
+        set -l s (math "$total % 60")
+
+        set_color e0af68
+        if test $h -gt 0
+            printf 'took %dh %dm' $h $m
+        else if test $m -gt 0
+            printf 'took %dm %ds' $m $s
+        else
+            printf 'took %ds' $s
+        end
+        set_color 565f89
+        echo -n '  ·  '
+    end
+
+    set_color 565f89
+    echo -n (date '+%H:%M:%S')
+    set_color normal
+end
+FISH_RIGHT
 
     # If we're root acting on behalf of a normal user, hand the files back to them.
     if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
         chown -R "$TARGET_USER:$(id -gn "$TARGET_USER")" "$TARGET_HOME/.config/fish"
     fi
 
-    # Equivalent of `source fish_prompt.fish`: make sure it parses cleanly.
-    # (Fish also auto-loads everything in ~/.config/fish/functions on startup.)
-    if "$FISH_PATH" -n "$prompt_file"; then
-        ok "Prompt installed → $prompt_file"
+    # Make sure both files parse cleanly.
+    # (Fish auto-loads everything in ~/.config/fish/functions on startup.)
+    if "$FISH_PATH" -n "$prompt_file" && "$FISH_PATH" -n "$right_file"; then
+        ok "Prompt installed → $func_dir"
     else
-        warn "Prompt file was written but fish reported a syntax problem."
+        warn "Prompt files were written but fish reported a syntax problem."
     fi
 }
 
@@ -186,6 +350,16 @@ disable_greeting() {
 # ── main ──────────────────────────────────────────────────────────────────────
 main() {
     printf '\n%s  🐟  fish-look-cool%s\n\n' "$C_B" "$C_0"
+
+    if [[ $PROMPT_ONLY -eq 1 ]]; then
+        FISH_PATH="$(command -v fish)" || die "fish is not installed yet. Run without --prompt-only first."
+        info "Configuring for user: $TARGET_USER"
+        info "Installing the custom prompt…"
+        install_prompt
+        printf '\n%s  Prompt updated! 🎉%s\n' "$C_G" "$C_0"
+        printf '  Run  exec fish  (or open a new terminal) to see it.\n\n'
+        return 0
+    fi
 
     detect_os
     info "Detected: $OS_NAME  (package manager: $PM)"
