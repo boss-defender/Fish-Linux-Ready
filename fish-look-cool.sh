@@ -9,9 +9,10 @@
 #    pacman  → Arch Linux, Manjaro, Omarchy (and Arch-based derivatives)
 #
 #  OMARCHY SPECIAL HANDLING:
-#    Omarchy's boot chain requires Bash as the login shell. We keep Bash as the
-#    login shell and configure the terminal emulator to launch Fish. This is
-#    the officially supported pattern (see omarchy-fish package).
+#    Omarchy's boot chain requires Bash as the login shell. Instead of
+#    changing the login shell (which causes a black screen), we configure the
+#    terminal emulator to launch Fish. This is the officially supported
+#    pattern (see Omarchy Discussion #2495).
 #
 #  Usage:  ./fish-look-cool.sh
 #          ./fish-look-cool.sh --prompt-only   (refresh the prompt only)
@@ -69,7 +70,7 @@ done
 
 if [[ $EUID -eq 0 ]]; then
     SUDO=""
-    TARGET_USER="${SUDO_USER:-root}"      # if run via sudo, configure the real user
+    TARGET_USER="${SUDO_USER:-root}"
 else
     if [[ $PROMPT_ONLY -eq 0 ]]; then
         command -v sudo >/dev/null 2>&1 || die "sudo is required. Install it or run this script as root."
@@ -106,7 +107,6 @@ detect_os() {
         arch|manjaro|endeavouros|garuda|artix|cachyos|arcolinux)         PM="pacman" ;;
     esac
 
-    # Support derivatives by their declared family, but never guess from installed tools.
     if [[ -z "$PM" ]]; then
         case "$like" in
             *" debian "*|*" ubuntu "*) PM="apt" ;;
@@ -129,7 +129,7 @@ detect_os() {
     esac
 }
 
-# ── keep sudo alive so long upgrades don't ask for the password twice ────────
+# ── keep sudo alive ───────────────────────────────────────────────────────────
 start_sudo_keepalive() {
     [[ -n "$SUDO" ]] || return 0
     info "Asking for your sudo password once…"
@@ -154,8 +154,6 @@ update_system() {
         pacman)
             if [[ $IS_OMARCHY -eq 1 && -x /usr/bin/omarchy-update-pacman-guard ]]; then
                 if [[ $EUID -ne 0 ]] && command -v omarchy-update >/dev/null 2>&1; then
-                    # Omarchy's supported path: snapshot, packages, migrations.
-                    # It revokes sudo when it finishes, so re-authorise after.
                     info "Omarchy detected: updating through 'omarchy update' (it may ask for your password again)…"
                     omarchy-update -y
                     sudo -v || die "sudo authentication failed."
@@ -176,9 +174,9 @@ install_fish() {
         apt)    run env DEBIAN_FRONTEND=noninteractive apt-get install -y fish ;;
         dnf)
             run dnf install -y fish
-            # On Fedora < 39, chsh lives in util-linux-user.  On newer Fedora
-            # and RHEL 9+, it is part of util-linux itself, but installing the
-            # subpackage is harmless (it is either present or a no-op).
+            # chsh is provided by util-linux-user on Fedora; install it
+            # so the shell change works reliably. On newer Fedora it is
+            # part of util-linux itself, so the install is a harmless no-op.
             run dnf install -y util-linux-user 2>/dev/null || true
             ;;
         pacman) run pacman -S --noconfirm --needed fish ;;
@@ -190,48 +188,103 @@ install_fish() {
 set_default_shell() {
     if [[ $IS_OMARCHY -eq 1 ]]; then
         # ── Omarchy: keep bash as login shell, launch fish from the terminal ──
-        # The officially supported pattern is to configure the terminal
-        # emulator to launch Fish, NOT to change the login shell.
-        # See: https://github.com/omacom/omarchy/discussions/2495
+        # Official guideline: https://github.com/omacom/omarchy/discussions/2495
+        # Changing the login shell directly causes a black screen on boot.
         local ghostty_conf="$TARGET_HOME/.config/ghostty/config"
         local alacritty_conf="$TARGET_HOME/.config/alacritty/alacritty.toml"
         local foot_conf="$TARGET_HOME/.config/foot/foot.ini"
 
-        # Ghostty (Omarchy's default terminal as of 3.2.0)
+        # ── Ghostty (Omarchy's default terminal as of 3.2.0) ──────────────
         if command -v ghostty >/dev/null 2>&1 || [[ -d "$TARGET_HOME/.config/ghostty" ]]; then
             mkdir -p "$(dirname "$ghostty_conf")"
             if ! grep -q "^command = " "$ghostty_conf" 2>/dev/null; then
-                echo "command = /usr/bin/fish" >> "$ghostty_conf"
+                echo "command = $FISH_PATH" >> "$ghostty_conf"
                 ok "Ghostty configured to launch fish"
             else
                 ok "Ghostty already configured to launch a custom shell"
             fi
         fi
 
-        # Alacritty (fallback for older Omarchy)
+        # ── Alacritty (fallback for older Omarchy) ────────────────────────
         if command -v alacritty >/dev/null 2>&1 || [[ -d "$TARGET_HOME/.config/alacritty" ]]; then
             mkdir -p "$(dirname "$alacritty_conf")"
             if ! grep -q "program = " "$alacritty_conf" 2>/dev/null; then
                 {
                     echo ""
                     echo "[terminal.shell]"
-                    echo "program = \"/usr/bin/fish\""
+                    echo "program = \"$FISH_PATH\""
                 } >> "$alacritty_conf"
                 ok "Alacritty configured to launch fish"
+            else
+                ok "Alacritty already configured to launch a custom shell"
             fi
         fi
 
-        # Foot (Omarchy 4+)
+        # ── Foot (Omarchy 4+) ─────────────────────────────────────────────
+        # The shell key belongs in [main], not [text-bindings].
+        # See foot.ini(5): https://manpages.debian.org/trixie/foot/foot.ini.5.en.html
         if command -v foot >/dev/null 2>&1 || [[ -d "$TARGET_HOME/.config/foot" ]]; then
             mkdir -p "$(dirname "$foot_conf")"
-            if ! grep -q "^shell=" "$foot_conf" 2>/dev/null; then
-                echo "shell=/usr/bin/fish" >> "$foot_conf"
+            touch "$foot_conf"
+
+            # Step 1: Repair corrupted foot.ini from old Omarchy migrations.
+            # Omarchy 3.8.3 wrote a literal "\n[text-bindings]" line (backslash-n
+            # as text, not a real newline). Foot rejects it and stops reading
+            # subsequent keys, so any shell= line below becomes invalid.
+            if grep -qF '\n[text-bindings]' "$foot_conf" 2>/dev/null; then
+                sed -i '/\\n\[text-bindings\]/d' "$foot_conf"
+                sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$foot_conf" 2>/dev/null || true
+                ok "Repaired corrupted foot.ini (literal \\n[text-bindings] removed)"
+            fi
+
+            # Step 2: Insert shell= into the correct section, or fix a
+            # misplaced one. We check if it is already correctly placed.
+            local shell_line
+            shell_line="$(grep -n '^shell=' "$foot_conf" 2>/dev/null | head -1 | cut -d: -f1 || true)"
+            if [[ -n "$shell_line" ]]; then
+                # Determine which section the existing shell= line is in.
+                # Find the last section header before the shell= line.
+                local section
+                section="$(head -n "$shell_line" "$foot_conf" | grep '^\[' | tail -1 || true)"
+                if [[ "$section" == "[main]" ]]; then
+                    ok "Foot already correctly configured (shell= in [main])"
+                else
+                    # Remove the misplaced shell= line and reinsert correctly.
+                    sed -i "${shell_line}d" "$foot_conf"
+                    if grep -q '^\[main\]' "$foot_conf" 2>/dev/null; then
+                        awk -v shell="$FISH_PATH" '
+                            /^\[main\]/ { print; print "shell=" shell; next }
+                            { print }
+                        ' "$foot_conf" > "$foot_conf.tmp" && mv "$foot_conf.tmp" "$foot_conf"
+                    else
+                        printf 'shell=%s\n\n' "$FISH_PATH" | cat - "$foot_conf" > "$foot_conf.tmp" \
+                            && mv "$foot_conf.tmp" "$foot_conf"
+                    fi
+                    ok "Moved shell= into [main] section in foot.ini"
+                fi
+            else
+                # No shell= line exists; insert one.
+                if grep -q '^\[main\]' "$foot_conf" 2>/dev/null; then
+                    awk -v shell="$FISH_PATH" '
+                        /^\[main\]/ { print; print "shell=" shell; next }
+                        { print }
+                    ' "$foot_conf" > "$foot_conf.tmp" && mv "$foot_conf.tmp" "$foot_conf"
+                else
+                    printf 'shell=%s\n\n' "$FISH_PATH" | cat - "$foot_conf" > "$foot_conf.tmp" \
+                        && mv "$foot_conf.tmp" "$foot_conf"
+                fi
                 ok "Foot configured to launch fish"
+            fi
+
+            # Step 3: Validate the config parses cleanly.
+            if command -v foot >/dev/null 2>&1; then
+                if ! foot --check-config 2>/dev/null; then
+                    warn "Foot config still has issues; check ~/.config/foot/foot.ini manually."
+                fi
             fi
         fi
 
-        # Also install the bash wrapper for completeness (e.g. SSH sessions
-        # that don't go through the terminal emulator).
+        # ── Bash wrapper as fallback for SSH / non-GUI sessions ──────────
         local bashrc="$TARGET_HOME/.bashrc"
         local wrapper_marker="# fish-look-cool: exec fish for interactive sessions"
         if ! grep -qF "$wrapper_marker" "$bashrc" 2>/dev/null; then
@@ -245,6 +298,8 @@ set_default_shell() {
                 echo "fi"
             } >> "$bashrc"
             ok "Bash wrapper installed (fallback for SSH / non-GUI sessions)"
+        else
+            ok "Bash wrapper already present in ~/.bashrc"
         fi
 
         # Ensure fish is in /etc/shells for completeness (ssh etc.)
@@ -275,7 +330,6 @@ set_default_shell() {
 # ── write the cool prompt ─────────────────────────────────────────────────────
 backup_if_exists() {
     local f="$1" new="${2:-}" backup
-    # Skip the backup when the file is already identical to what we install.
     if [[ -n "$new" && -f "$f" ]] && cmp -s -- "$f" "$new"; then
         return 0
     fi
@@ -308,8 +362,6 @@ install_prompt() {
     mkdir -p "$func_dir" "$conf_dir"
     if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
         target_group="$(id -gn "$TARGET_USER")"
-        # Correct only these directory entries; leave their contents and the
-        # rest of the user's Fish configuration tree untouched.
         chown "$TARGET_USER:$target_group" "$config_root" "$fish_config" "$func_dir" "$conf_dir"
     fi
     STAGING_DIR="$(mktemp -d "$func_dir/.fish-look-cool.XXXXXX")"
@@ -330,7 +382,6 @@ install_prompt() {
 #
 # Colours are Tokyo-Night-ish hex values; change them to taste.
 
-# ── git styling (used by the built-in fish_git_prompt) ───────────────────────
 set -g __fish_git_prompt_show_informative_status 1
 set -g __fish_git_prompt_char_stateseparator ' '
 set -g __fish_git_prompt_color_branch bb9af7 --bold
@@ -341,9 +392,6 @@ set -g __fish_git_prompt_color_untrackedfiles 7dcfff
 set -g __fish_git_prompt_color_invalidstate f7768e
 set -g __fish_git_prompt_color_upstream 7aa2f7
 
-# ── blank line between commands ──────────────────────────────────────────────
-# After every command we remember "leave a gap"; `clear` / `reset` forget it so
-# the prompt doesn't start with an empty line at the top of a fresh screen.
 function __flc_postexec --on-event fish_postexec
     if string match -qr '^\s*(clear|reset)\s*$' -- "$argv[1]"
         set -e __flc_gap
@@ -352,7 +400,6 @@ function __flc_postexec --on-event fish_postexec
     end
 end
 
-# ── readable path: ~/a/b/c, or …/x/y/z when it is deeper than 3 levels ───────
 function __flc_pwd
     set -l p $PWD
     if test "$p" = "$HOME"
@@ -371,15 +418,9 @@ end
 
 function fish_prompt
     set -l last_status $status
-
-    # the gap
     set -q __flc_gap; and echo
-
-    # ╭─ line 1
     set_color 565f89
     echo -n '╭─ '
-
-    # user@host — only over SSH or as root
     if set -q SSH_CONNECTION; or test "$USER" = root
         if test "$USER" = root
             set_color --bold f7768e
@@ -388,40 +429,28 @@ function fish_prompt
         end
         echo -n "$USER@"(prompt_hostname)' '
     end
-
-    # directory
     set_color --bold 7aa2f7
     echo -n (__flc_pwd)
-
-    # git branch + state
     set -l git (fish_git_prompt '%s' 2>/dev/null)
     if test -n "$git"
         set_color 565f89
         echo -n ' on '
         echo -n $git
     end
-
-    # python virtualenv
     if set -q VIRTUAL_ENV
         set_color 565f89
         echo -n ' via '
         set_color 73daca
         echo -n (string replace -r '.*/' '' -- $VIRTUAL_ENV)
     end
-
-    # exit code of the last command, if it failed
     if test $last_status -ne 0
         set_color --bold f7768e
         echo -n "  ✘ $last_status"
     end
-
-    # │ spacer line (the little gap between the info line and the arrow)
     set_color normal
     echo
     set_color 565f89
     echo '│'
-
-    # ╰─❯ arrow line
     echo -n '╰─'
     if test $last_status -eq 0
         set_color --bold 9ece6a
@@ -433,9 +462,7 @@ function fish_prompt
 end
 FISH_PROMPT
 
-    # Foot can override TERM (Omarchy uses xterm-256color), but it reports its
-    # identity through XTVERSION. Detect it at fish_prompt time, when Fish makes
-    # status terminal available, before drawing the first prompt.
+    # ── Foot reflow detection ────────────────────────────────────────────────
     cat > "$reflow_tmp" <<'FISH_REFLOW'
 # fish-look-cool · detect Foot even when TERM is set to xterm-256color.
 # Runs once. `status terminal` needs fish 4.1+; older fish falls back to $TERM.
@@ -448,7 +475,6 @@ function __flc_detect_foot_reflow --on-event fish_prompt
 end
 FISH_REFLOW
 
-    # Validate every new Fish file before replacing anything.
     if ! "$FISH_PATH" -n "$prompt_tmp" || ! "$FISH_PATH" -n "$reflow_tmp"; then
         die "Fish found a syntax problem in the new prompt; existing files were left unchanged."
     fi
@@ -462,10 +488,7 @@ FISH_REFLOW
         chown "$TARGET_USER:$target_group" "$prompt_tmp" "$reflow_tmp"
     fi
 
-    # Each rename is atomic because staging and destination share a filesystem.
     mv -f -- "$prompt_tmp" "$prompt_file"
-    # Preserve any previously installed right prompt above, then remove it so
-    # older installs stop showing the clock and command durations.
     if [[ -f "$right_file" ]]; then
         rm -- "$right_file"
     fi
@@ -496,7 +519,6 @@ FISH_OMARCHY
 
 # ── remove the boring welcome message ─────────────────────────────────────────
 disable_greeting() {
-    # Run as the target user so the universal variable lands in THEIR fish_variables.
     if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
         runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" "$FISH_PATH" -c 'set -U fish_greeting ""'
     else
@@ -568,7 +590,6 @@ main() {
         printf '  fish is your default shell from your next login.\n\n'
     fi
 
-    # Drop straight into fish so the new look shows up right now.
     if [[ -t 0 && -t 1 && $EUID -ne 0 ]]; then
         cleanup
         exec "$FISH_PATH"
