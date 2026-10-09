@@ -1,9 +1,16 @@
 # Fish-Linux-Ready
 
+Recommended : **fish-look-cool.sh**
+
 **Run**
 
-```text
+```bash
 chmod +x fish-look-cool && ./fish-look-cool
 ```
+**Or,**
 
-**Supported OS:** fedora , ubuntu , any arch linux, pop os , debian , linux mint  , zorin os , kali linux , manjaro linux
+```bash
+chmod +x fish-look-cool.sh && ./fish-look-cool.sh  --prompt-only
+```
+
+**Supported OS:** fedora , ubuntu , any arch linux, Omarchy , pop os , debian , linux mint  , zorin os , kali linux , manjaro linux
