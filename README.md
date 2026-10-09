@@ -2,7 +2,7 @@
 
 Recommended : **fish-look-cool.sh** for all linux . 
 
-but for fedora : use **fish-look-cool** as it is already tested and works fine.
+But for **Fedora Linux** : use **fish-look-cool** as it is already tested and works fine.
 
 **Run**
 
